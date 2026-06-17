@@ -145,8 +145,8 @@ UNTEST_UNIT(Untest, Examples, Asserts)
 	UNTEST_ASSERT_NULLPTR(NullPtr);
 	UNTEST_ASSERT_PTR(ValidPtr);
 
-	const TCHAR* MyTestStr = TEXT("MyTest String");
-	const TCHAR* MyTestStrCaps = TEXT("MYTEST STRING");
+	const TCHAR* MyTestStr = TEXT("My Test String");
+	const TCHAR* MyTestStrCaps = TEXT("MY TEST STRING");
 	const TCHAR* ThunderdomeStr = TEXT("Thunderdome");
 
 	FString MyTestFStr = MyTestStr;
@@ -250,7 +250,7 @@ UNTEST_UNIT_OPTS(Untest, Examples, TimeoutFlags2, TimeoutFlags2Opts)
 	co_await Squid::Suspend();
 }
 
-class FExampleCustomUnitTestFixture : public FBVUnitTestFixture
+class FExampleCustomUnitTestFixture : public FUntestUnitFixture
 {
 	virtual UntestTask Setup(FUntestContext& TestContext) override
 	{
@@ -340,7 +340,7 @@ UNTEST_CLIENTSERVER(Untest, Examples, ClientServerSimple)
 	co_return;
 }
 
-struct UntestClientServerReplicationFixture : public FBVClientServerTestFixture
+struct UntestClientServerReplicationFixture : public FUntestClientServerFixture
 {
 	virtual FUntestGameClasses GetGameClasses() const override
 	{

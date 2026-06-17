@@ -20,7 +20,7 @@
 //           -Name=Add
 //
 //   -ReportPath: Optional. Specify a path to write a junit-style xml report file. For example:
-//           -ReportPath=C:\reports\bvtestreport.xml
+//           -ReportPath=C:\reports\untestreport.xml
 //           -ReportPath=Intermediate\Untest\Reports\run1.xml
 //
 //   -NoTimeout: Optional. Use to suppress failing tests due to timeouts. Handy for ensuring

@@ -1,11 +1,10 @@
 #pragma once
 
-#include "GameFramework/PlayerController.h"
-#include "GameFramework/GameModeBase.h"
+#include "Untest.h"
 #include "UntestExamples.generated.h"
 
 UCLASS()
-class AUntestExampleGameMode : public AGameModeBase
+class AUntestExampleGameMode : public AUntestGameMode
 {
 	GENERATED_BODY()
 
@@ -14,7 +13,7 @@ public:
 };
 
 UCLASS()
-class AUntestExamplePlayerController : public APlayerController
+class AUntestExamplePlayerController : public AUntestPlayerController
 {
 	GENERATED_BODY()
 

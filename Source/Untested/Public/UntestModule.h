@@ -43,17 +43,17 @@ struct FUntestResults
 	TArray<FString> Errors;
 };
 
-DECLARE_DELEGATE_OneParam(FBVOnTestStarted, const FUntestName& /*TestName*/);
-DECLARE_DELEGATE_OneParam(FBVOnTestComplete, const FUntestResults& /*Results*/);
-DECLARE_DELEGATE_OneParam(FBVOnAllTestsComplete, TArrayView<const FUntestResults> /*AllResults*/);
+DECLARE_DELEGATE_OneParam(FUntestOnTestStarted, const FUntestName& /*TestName*/);
+DECLARE_DELEGATE_OneParam(FUntestOnTestComplete, const FUntestResults& /*Results*/);
+DECLARE_DELEGATE_OneParam(FUntestOnAllTestsComplete, TArrayView<const FUntestResults> /*AllResults*/);
 
 struct FUntestRunOpts
 {
 	bool bNoTimeouts = false;
 	bool bIncludeDisabled = false;
-	FBVOnTestStarted OnTestStarted;
-	FBVOnTestComplete OnTestComplete;
-	FBVOnAllTestsComplete OnAllTestsComplete;
+	FUntestOnTestStarted OnTestStarted;
+	FUntestOnTestComplete OnTestComplete;
+	FUntestOnAllTestsComplete OnAllTestsComplete;
 };
 
 class FUntestModule : public IModuleInterface
@@ -83,6 +83,7 @@ public:
 	void StopTests();
 	TArrayView<const FUntestResults> GetResults() const;
 	bool WriteTestReport(const TCHAR* ReportPath) const;
+	static bool WriteTestReport(const TCHAR* ReportPath, TArrayView<const FUntestResults> Results);
 
 private:
 	using FTestFactoryMap = TMap<FString, const FUntestFixtureFactory*>;

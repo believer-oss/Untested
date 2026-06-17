@@ -82,6 +82,30 @@ bool FUntestModule::Tick(float DeltaTime)
 					continue;
 				}
 
+				// Check PreflightCheck for all tests (fixtures can override to skip)
+				{
+					TSharedPtr<FUntestContext> PreflightContext = MakeShared<FUntestContext>();
+					PreflightContext->TestName = Factory->GetName();
+					TSharedPtr<FUntestFixture> PreflightFixture = Factory->New(PreflightContext);
+
+					FString SkipReason;
+					if (!PreflightFixture->PreflightCheck(SkipReason))
+					{
+						FUntestResults Results;
+						Results.TestName = Factory->GetName();
+						Results.DurationMs = 0.0f;
+						Results.Result = EUntestResult::Skipped;
+						if (!SkipReason.IsEmpty())
+						{
+							UE_LOG(LogUntest, Display, TEXT("Skipping %s: %s"), *Factory->GetName().ToFull(), *SkipReason);
+						}
+
+						TestResults.Emplace(MoveTemp(Results));
+						RunOpts.OnTestComplete.ExecuteIfBound(TestResults.Last());
+						continue;
+					}
+				}
+
 				TSharedPtr<FUntestContext> TestContext = MakeShared<FUntestContext>();
 				TestContext->TestName = Factory->GetName();
 				TestContext->TaskManager = MakeUnique<Squid::TaskManager>();
@@ -194,9 +218,16 @@ bool FUntestModule::Tick(float DeltaTime)
 
 	if (RunningTests.IsEmpty() && QueuedTests.IsEmpty() && StoppingTests.IsEmpty())
 	{
+		UE_LOG(LogUntest, Display, TEXT("All tests complete. Calling OnAllTestsComplete with %d results."), TestResults.Num());
 		RunOpts.OnAllTestsComplete.ExecuteIfBound(TestResults);
 
 		return false; // unschedule tick
+	}
+
+	// Debug logging to understand why tests might not be completing
+	if (RunningTests.Num() == 0 && QueuedTests.Num() == 0 && TestResults.Num() > 0)
+	{
+		UE_LOG(LogUntest, Warning, TEXT("Tests appear complete but StoppingTests.Num()=%d is preventing completion"), StoppingTests.Num());
 	}
 
 	return true;
@@ -301,6 +332,11 @@ TArrayView<const FUntestResults> FUntestModule::GetResults() const
 
 bool FUntestModule::WriteTestReport(const TCHAR* ReportPath) const
 {
+	return WriteTestReport(ReportPath, TestResults);
+}
+
+bool FUntestModule::WriteTestReport(const TCHAR* ReportPath, TArrayView<const FUntestResults> Results)
+{
 	struct FTestStats
 	{
 		int32 NumTests = 0;
@@ -323,7 +359,7 @@ bool FUntestModule::WriteTestReport(const TCHAR* ReportPath) const
 
 	FTestStats TotalStats;
 	TSortedMap<FString, FTestModuleResults> Modules;
-	for (const FUntestResults& Result : TestResults)
+	for (const FUntestResults& Result : Results)
 	{
 		FTestModuleResults& ModuleResults = Modules.FindOrAdd(Result.TestName.Module);
 		FTestCategoryResults& CategoryResults = ModuleResults.Categories.FindOrAdd(Result.TestName.Category);

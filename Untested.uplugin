@@ -26,6 +26,10 @@
 		{
 			"Name": "SquidTasks",
 			"Enabled": true
+		},
+		{
+			"Name": "CommonGame",
+			"Enabled": true
 		}
 	]
 }
