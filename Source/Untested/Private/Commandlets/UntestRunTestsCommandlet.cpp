@@ -1,6 +1,7 @@
 #include "UntestRunTestsCommandlet.h"
 #include "Untest.h"
 #include "UntestModule.h"
+#include "Misc/FileHelper.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogUntestRunTestsCommandlet, Display, All);
 
@@ -8,8 +9,10 @@ struct FUntestRunTestsCommandletOptions
 {
 	FUntestSearchFilter Filter;
 	FString ReportPath;
+	FString TestsFile; // File containing exact test names to run (one per line)
 	bool bNoTimeouts = false;
 	bool bIncludeDisabled = false;
+	bool bListTests = false;
 
 	static FUntestRunTestsCommandletOptions FromParams(const FString& Params)
 	{
@@ -31,6 +34,11 @@ struct FUntestRunTestsCommandletOptions
 			Options.ReportPath = *ReportPath;
 		}
 
+		if (FString* TestsFilePath = SwitchParams.Find(TEXT("TestsFile")))
+		{
+			Options.TestsFile = *TestsFilePath;
+		}
+
 		if (Switches.Contains(TEXT("NoTimeout")) || Switches.Contains(TEXT("NoTimeouts")))
 		{
 			Options.bNoTimeouts = true;
@@ -39,6 +47,11 @@ struct FUntestRunTestsCommandletOptions
 		if (Switches.Contains(TEXT("IncludeDisabled")))
 		{
 			Options.bIncludeDisabled = true;
+		}
+
+		if (Switches.Contains(TEXT("ListTests")))
+		{
+			Options.bListTests = true;
 		}
 
 		return Options;
@@ -52,34 +65,120 @@ int32 UUntestRunTestsCommandlet::Main(const FString& Params)
 
 	const FUntestRunTestsCommandletOptions RunOptions = FUntestRunTestsCommandletOptions::FromParams(Params);
 
-	UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Discovering tests with name filter '%s'..."), *RunOptions.Filter.SearchName);
-
 	FUntestModule& Module = FUntestModule::Get();
 
-	TArray<FUntestInfo> Tests = Module.FindTests(RunOptions.Filter);
-	if (Tests.IsEmpty())
+	TArray<FString> TestNames;
+
+	// If a TestsFile is provided, read exact test names from it (bypasses filter-based discovery)
+	if (!RunOptions.TestsFile.IsEmpty())
 	{
-		UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("No tests found for Name '%s'."), *RunOptions.Filter.SearchName);
+		UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Reading test names from file: %s"), *RunOptions.TestsFile);
+
+		FString FileContents;
+		if (!FFileHelper::LoadFileToString(FileContents, *RunOptions.TestsFile))
+		{
+			UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("Failed to read tests file: %s"), *RunOptions.TestsFile);
+			return 1;
+		}
+
+		TArray<FString> Lines;
+		FileContents.ParseIntoArrayLines(Lines, true);
+
+		for (const FString& Line : Lines)
+		{
+			FString TrimmedLine = Line.TrimStartAndEnd();
+			if (!TrimmedLine.IsEmpty() && !TrimmedLine.StartsWith(TEXT("#")))
+			{
+				TestNames.Add(TrimmedLine);
+			}
+		}
+
+		if (TestNames.IsEmpty())
+		{
+			UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("No test names found in file: %s"), *RunOptions.TestsFile);
+			return 0;
+		}
+
+		UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Loaded %d test names from file."), TestNames.Num());
+	}
+	else
+	{
+		// Standard filter-based discovery
+		UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Discovering tests with name filter '%s'..."), *RunOptions.Filter.SearchName);
+
+		TArray<FUntestInfo> Tests = Module.FindTests(RunOptions.Filter);
+		if (Tests.IsEmpty())
+		{
+			UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("No tests found for Name '%s'."), *RunOptions.Filter.SearchName);
+			return 0;
+		}
+
+		UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Found %d tests to run."), Tests.Num());
+
+		TestNames.Reserve(Tests.Num());
+		for (FUntestInfo& Info : Tests)
+		{
+			TestNames.Emplace(Info.Name.ToFull());
+		}
+	}
+
+	// If -ListTests flag is provided, just list the tests and exit
+	if (RunOptions.bListTests)
+	{
+		UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Available tests:"));
+		for (const FString& TestName : TestNames)
+		{
+			UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("  - %s"), *TestName);
+		}
+
+		// Use the existing test report infrastructure for consistent output
+		// Create "Skipped" results for each discovered test
+		if (!RunOptions.ReportPath.IsEmpty())
+		{
+			TArray<FUntestResults> ListResults;
+			ListResults.Reserve(TestNames.Num());
+
+			for (const FString& TestName : TestNames)
+			{
+				FUntestResults& Result = ListResults.AddDefaulted_GetRef();
+				Result.TestName = FUntestName::FromFull(TestName);
+				Result.Result = EUntestResult::Skipped;
+				Result.DurationMs = 0.0f;
+			}
+
+			// Use static method to write report without modifying module state
+			if (FUntestModule::WriteTestReport(*RunOptions.ReportPath, ListResults))
+			{
+				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test list written to: %s"), *RunOptions.ReportPath);
+			}
+			else
+			{
+				UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("Failed to write test list to: %s"), *RunOptions.ReportPath);
+				return 1;
+			}
+		}
+
 		return 0;
 	}
 
-	UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Found %d tests to run."), Tests.Num());
+	UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Found %d tests to run."), TestNames.Num());
 
-	TArray<FString> TestNames;
-	TestNames.Reserve(Tests.Num());
-	for (FUntestInfo& Info : Tests)
-	{
-		TestNames.Emplace(Info.Name.ToFull());
-	}
+	bool bAreTestsRunning = true;
+	bool bAnyFailures = false;
+	bool bReportWritten = false;
 
-	auto OnTestStartedDelegate = FBVOnTestStarted::CreateLambda([](const FUntestName& TestName)
+	auto OnTestStartedDelegate = FUntestOnTestStarted::CreateLambda([](const FUntestName& TestName)
 		{
 			UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Running test: %s"), *TestName.ToFull());
 		});
 
-	auto OnTestCompleteDelegate = FBVOnTestComplete::CreateLambda([](const FUntestResults& Results)
+	auto OnTestCompleteDelegate = FUntestOnTestComplete::CreateLambda([&Module, &RunOptions, &bReportWritten](const FUntestResults& Results)
 		{
-			if (Results.Errors.IsEmpty())
+			if (Results.Result == EUntestResult::Skipped)
+			{
+				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("%s skipped."), *Results.TestName.ToFull());
+			}
+			else if (Results.Errors.IsEmpty())
 			{
 				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("%s succeeded (%.2fms)"), *Results.TestName.ToFull(), Results.DurationMs);
 			}
@@ -91,31 +190,61 @@ int32 UUntestRunTestsCommandlet::Main(const FString& Params)
 					UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("%s"), *Error);
 				}
 			}
+
+			// Write report incrementally after each test to avoid losing results if process exits early
+			if (RunOptions.ReportPath.IsEmpty() == false)
+			{
+				Module.WriteTestReport(*RunOptions.ReportPath);
+				bReportWritten = true;
+			}
 		});
 
-	bool bAreTestsRunning = true;
-	bool bAnyFailures = false;
-	auto OnAllTestsCompleteDelegate = FBVOnAllTestsComplete::CreateLambda([&bAreTestsRunning, &bAnyFailures](TArrayView<const FUntestResults> AllResults)
+	auto OnAllTestsCompleteDelegate = FUntestOnAllTestsComplete::CreateLambda([&bAreTestsRunning, &RunOptions, &Module, &bReportWritten, &bAnyFailures](TArrayView<const FUntestResults> AllResults)
 		{
 			bAreTestsRunning = false;
 
 			int32 NumTests = AllResults.Num();
 			int32 NumFailed = 0;
+			int32 NumSkipped = 0;
 			for (const FUntestResults& Results : AllResults)
 			{
-				NumFailed += (Results.Errors.Num() > 0) ? 1 : 0;
+				if (Results.Result == EUntestResult::Fail)
+				{
+					NumFailed++;
+				}
+				else if (Results.Result == EUntestResult::Skipped)
+				{
+					NumSkipped++;
+				}
 			}
+
+			int32 NumSucceeded = NumTests - NumFailed - NumSkipped;
 
 			if (NumFailed == 0)
 			{
-				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test run finished. %d / %d tests succeeded."), NumTests, NumTests);
+				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test run finished. %d / %d tests succeeded, %d skipped."),
+					NumSucceeded, NumTests, NumSkipped);
 			}
 			else
 			{
-				int32 NumSucceeded = NumTests - NumFailed;
-				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test run finished. %d / %d tests succeeded. %d tests failed."),
-					NumSucceeded, NumTests, NumFailed);
+				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test run finished. %d / %d tests succeeded, %d skipped, %d failed."),
+					NumSucceeded, NumTests, NumSkipped, NumFailed);
 				bAnyFailures = true;
+			}
+
+			// Write the report immediately to avoid losing results if the process exits early
+			if (RunOptions.ReportPath.IsEmpty() == false && bReportWritten == false)
+			{
+				UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Writing test report to: %s"), *RunOptions.ReportPath);
+				if (Module.WriteTestReport(*RunOptions.ReportPath))
+				{
+					UE_LOG(LogUntestRunTestsCommandlet, Display, TEXT("Test report written successfully."));
+					bReportWritten = true;
+				}
+				else
+				{
+					UE_LOG(LogUntestRunTestsCommandlet, Error, TEXT("Failed to write test report."));
+				}
 			}
 		});
 
@@ -136,8 +265,10 @@ int32 UUntestRunTestsCommandlet::Main(const FString& Params)
 		CommandletHelpers::TickEngine();
 	}
 
-	if (RunOptions.ReportPath.IsEmpty() == false)
+	// If report wasn't written in OnAllTestsComplete (shouldn't happen), write it now
+	if (RunOptions.ReportPath.IsEmpty() == false && bReportWritten == false)
 	{
+		UE_LOG(LogUntestRunTestsCommandlet, Warning, TEXT("Report not written in OnAllTestsComplete, writing now as fallback..."));
 		Module.WriteTestReport(*RunOptions.ReportPath);
 	}
 

@@ -3,6 +3,7 @@
 
 #include "Editor.h"
 #include "Editor/UnrealEdEngine.h"
+#include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/NetDriver.h"
 #include "EngineUtils.h"
@@ -13,8 +14,8 @@
 
 DEFINE_LOG_CATEGORY(LogUntest);
 
-#define BV_FIXTURE_TASK_NAME(InTestName) TASK_NAME(__FUNCTION__, [InTestName]() { \
-	return TestName;                                                              \
+#define UNTEST_FIXTURE_TASK_NAME(InTestName) TASK_NAME(__FUNCTION__, [InTestName]() { \
+	return TestName;                                                                  \
 })
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -42,14 +43,14 @@ FUntestFixtureFactory::~FUntestFixtureFactory()
 
 UntestTask FUntestFixture::SetupFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	co_await Setup(*FixtureContext);
 }
 
 UntestTask FUntestFixture::TeardownFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	co_await Teardown(*FixtureContext);
 }
@@ -71,26 +72,31 @@ UntestTask FUntestFixture::Teardown(FUntestContext& TestContext)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// FBVUnitTestFixture
+// FUntestUnitFixture
 
-UntestTask FBVUnitTestFixture::RunFixture(const FString TestName)
+UntestTask FUntestUnitFixture::RunFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	co_await Run(GetContext());
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// FBVWorldTestFixture
+// FUntestWorldFixture
 
-FBVWorldTestFixture::~FBVWorldTestFixture()
+FUntestWorldFixture::~FUntestWorldFixture()
 {
 	TeardownWorld();
 }
 
-UntestTask FBVWorldTestFixture::SetupFixture(const FString TestName)
+TSubclassOf<ULocalPlayer> FUntestWorldFixture::GetLocalPlayerClass() const
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	return UCommonLocalPlayer::StaticClass();
+}
+
+UntestTask FUntestWorldFixture::SetupFixture(const FString TestName)
+{
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	FUntestContext& TestContext = GetContext();
 
@@ -100,9 +106,14 @@ UntestTask FBVWorldTestFixture::SetupFixture(const FString TestName)
 	Package->MarkAsFullyLoaded();
 	TestContext.Packages[EUntestWorldType::Server] = Package;
 
+	const FUntestGameClasses DefaultClasses = GetGameClasses();
+	TSubclassOf<UUntestGameInstance> GameInstanceClass = DefaultClasses.GameInstanceClass
+		? DefaultClasses.GameInstanceClass
+		: TSubclassOf<UUntestGameInstance>(UUntestGameInstance::StaticClass());
+
 	const FString GameInstanceName = FString::Printf(TEXT("UntestGameInstance_%s"), *TestName);
 
-	UUntestGameInstance* GameInstance = CastChecked<UUntestGameInstance>(NewObject<UUntestGameInstance>(GetTransientPackage(), *GameInstanceName));
+	UUntestGameInstance* GameInstance = CastChecked<UUntestGameInstance>(NewObject<UUntestGameInstance>(GetTransientPackage(), GameInstanceClass, *GameInstanceName));
 	TestContext.GameInstances[EUntestWorldType::Server] = GameInstance;
 
 	const bool bInformEngineOfWorld = false;
@@ -130,6 +141,14 @@ UntestTask FBVWorldTestFixture::SetupFixture(const FString TestName)
 	World->SetGameInstance(GameInstance);
 	World->InitWorld();
 	World->SetPlayInEditorInitialNetMode(NM_DedicatedServer);
+
+	// Set custom GameMode if specified
+	if (DefaultClasses.GameModeClass)
+	{
+		World->GetWorldSettings()->DefaultGameMode = DefaultClasses.GameModeClass;
+		World->SetGameMode(FURL());
+	}
+
 	World->InitializeActorsForPlay(FURL());
 	if (IsValid(World->GetWorldSettings()))
 	{
@@ -139,12 +158,45 @@ UntestTask FBVWorldTestFixture::SetupFixture(const FString TestName)
 	}
 	World->BeginPlay();
 
+	// Optionally create a LocalPlayer for tests that need ULocalPlayerSubsystem derivatives.
+	// We set WorldContext.GameViewport temporarily during AddLocalPlayer so that
+	// PlayerAdded() passes it to the LocalPlayer — required for GetGameInstance() during
+	// subsystem initialization. We null it immediately after to prevent the editor engine
+	// tick's CleanupGameViewport() from destroying it.
+	// The LocalPlayer retains ViewportClient as a UPROPERTY reference (set by PlayerAdded).
+	if (ShouldCreateLocalPlayer())
+	{
+		TSubclassOf<ULocalPlayer> LocalPlayerClass = GetLocalPlayerClass();
+		if (!LocalPlayerClass)
+		{
+			LocalPlayerClass = UCommonLocalPlayer::StaticClass();
+		}
+
+		TGuardValue<bool> EditorGuard(GIsEditor, false);
+		UUntestViewportClient* VC = NewObject<UUntestViewportClient>(GEngine);
+		VC->InitForTest(World, GameInstance);
+		WorldContext.GameViewport = VC;
+
+		const FPlatformUserId UserId = IPlatformInputDeviceMapper::Get().GetPrimaryPlatformUser();
+		ULocalPlayer* NewPlayer = NewObject<ULocalPlayer>(GEngine, LocalPlayerClass);
+		int32 InsertIndex = GameInstance->AddLocalPlayer(NewPlayer, UserId);
+
+		// Remove from WorldContext immediately — the LocalPlayer keeps VC alive via ViewportClient.
+		WorldContext.GameViewport = nullptr;
+
+		if (InsertIndex == INDEX_NONE)
+		{
+			TestContext.AddError(TEXT("Failed to add LocalPlayer to GameInstance"));
+			co_return;
+		}
+	}
+
 	co_await Setup(TestContext);
 }
 
-UntestTask FBVWorldTestFixture::RunFixture(const FString TestName)
+UntestTask FUntestWorldFixture::RunFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	FUntestContext& TestContext = GetContext();
 	UntestTask Task = Run(TestContext, EUntestWorldType::Server);
@@ -168,9 +220,9 @@ UntestTask FBVWorldTestFixture::RunFixture(const FString TestName)
 	co_await Squid::WaitUntil(Func);
 }
 
-UntestTask FBVWorldTestFixture::TeardownFixture(const FString TestName)
+UntestTask FUntestWorldFixture::TeardownFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	FUntestContext& TestContext = GetContext();
 	co_await Teardown(TestContext);
@@ -178,7 +230,7 @@ UntestTask FBVWorldTestFixture::TeardownFixture(const FString TestName)
 	TeardownWorld();
 }
 
-void FBVWorldTestFixture::TeardownWorld()
+void FUntestWorldFixture::TeardownWorld()
 {
 	FUntestContext& TestContext = GetContext();
 
@@ -191,6 +243,21 @@ void FBVWorldTestFixture::TeardownWorld()
 	}
 
 	// See https://minifloppy.it/posts/2024/automated-testing-specs-ue5/#uworld-fixture
+
+	// Remove local players BEFORE world teardown so their subsystems can
+	// deinitialize while the world is still valid.
+	if (UGameInstance* GameInstance = TestContext.GameInstances[EUntestWorldType::Server].Get())
+	{
+		if (UUntestGameInstance* TestGI = Cast<UUntestGameInstance>(GameInstance))
+		{
+			TestGI->SetAllowRemoveLocalPlayer(true);
+		}
+		while (GameInstance->GetLocalPlayers().Num() > 0)
+		{
+			GameInstance->RemoveLocalPlayer(GameInstance->GetLocalPlayers().Last());
+		}
+	}
+
 	if (UWorld* World = TestContext.Worlds[EUntestWorldType::Server].Get())
 	{
 		World->BeginTearingDown();
@@ -225,23 +292,23 @@ void FBVWorldTestFixture::TeardownWorld()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// FBVClientServerTestFixture
+// FUntestClientServerFixture
 
-FBVClientServerTestFixture::~FBVClientServerTestFixture()
+FUntestClientServerFixture::~FUntestClientServerFixture()
 {
 	// If the test timeouts, it won't get a chance to run the normal teardown logic, so we attempt
 	// to run it again here just in case.
 	TeardownClientServer();
 }
 
-UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
+UntestTask FUntestClientServerFixture::SetupFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	const FUntestGameClasses DefaultClasses = GetGameClasses();
 	const FUntestGameClasses Classes = {
 		DefaultClasses.GameInstanceClass ? DefaultClasses.GameInstanceClass : TSubclassOf<UUntestGameInstance>(UUntestGameInstance::StaticClass()),
-		DefaultClasses.GameModeClass ? DefaultClasses.GameModeClass : TSubclassOf<AGameModeBase>(AGameModeBase::StaticClass()),
+		DefaultClasses.GameModeClass ? DefaultClasses.GameModeClass : TSubclassOf<AGameModeBase>(AUntestGameMode::StaticClass()),
 	};
 
 	FUntestContext& TestContext = GetContext();
@@ -249,18 +316,32 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 	FString PackageCommonName = FString::Printf(TEXT("TestPackage_%s"), *TestName);
 	PackageCommonName.ReplaceCharInline('.', '_'); // UE seems to replace the final . with a : so just use underscores for consistency
 
-	// See UEditorEngine::CreateInnerProcessPIEGameInstance() for the reference code for this setup logic
-	for (int32 TestWorldType = EUntestWorldType::Server; TestWorldType != EUntestWorldType::Count; ++TestWorldType)
+	const int32 NumClients = FMath::Max(1, GetNumClients());
+
+	// Total iterations: 1 server + NumClients clients. The first iteration is server (PIEInstance==Server==0),
+	// then each subsequent iteration is a client (PIEInstance==1, 2, ...). Storage:
+	//   - Server iteration writes into Worlds[Server] / GameInstances[Server] / Packages[Server].
+	//   - First client iteration writes into Worlds[Client] / GameInstances[Client] / Packages[Client].
+	//   - Additional client iterations append into ExtraClient* arrays.
+	// This preserves EUntestWorldType::Count==2 and the macro contract for UNTEST_IS_SERVER/CLIENT.
+	const int32 TotalIterations = 1 + NumClients;
+	for (int32 IterIndex = 0; IterIndex < TotalIterations; ++IterIndex)
 	{
-		const ENetMode NetMode = (TestWorldType == EUntestWorldType::Server) ? NM_DedicatedServer : NM_Client;
-		const TCHAR* NetModeStr = (TestWorldType == EUntestWorldType::Server) ? TEXT("Server") : TEXT("Client");
+		const bool bIsServerIter = (IterIndex == 0);
+		const int32 ClientIndex = bIsServerIter ? INDEX_NONE : (IterIndex - 1); // 0..NumClients-1
+		const ENetMode NetMode = bIsServerIter ? NM_DedicatedServer : NM_Client;
+		const TCHAR* NetModeStr = bIsServerIter ? TEXT("Server") : TEXT("Client");
+
+		// PIEInstance must be unique per world (Server==0, Client0==1, Client1==2, ...). The PIE package
+		// prefix derives from this index so each client gets a distinct package name.
+		const int32 PIEInstanceIndex = IterIndex;
 
 		// UE expects that replicated worlds are owned by a parent package, since they need to have a stable name for networking. However
 		// the world creation process will spawn actors into the parent package that have fixed names, which isn't allowed as all uobjects
 		// must have unique names. PIE cheats by having the names of the packages be distinct, but remapping them when doing replication
 		// so that the names match up, so we will hook into that system here. See UEditorEngine::NetworkRemapPath() and its usage in
 		// PackageMapClient.cpp
-		const FString PIEPackagePrefix = UWorld::BuildPIEPackagePrefix(TestWorldType);
+		const FString PIEPackagePrefix = UWorld::BuildPIEPackagePrefix(PIEInstanceIndex);
 		const FString PackageName = FString::Printf(TEXT("/Untest/%s%s"), *PIEPackagePrefix, *PackageCommonName);
 		FSoftObjectPath::AddPIEPackageName(FName(*PackageName));
 
@@ -270,27 +351,18 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 		Package->AddToRoot();
 		Package->MarkAsFullyLoaded();
 
-		TestContext.Packages[TestWorldType] = Package;
-
-		UUntestGameInstance* GameInstance = CastChecked<UUntestGameInstance>(NewObject<UUntestGameInstance>(Package, Classes.GameInstanceClass));
-		TestContext.GameInstances[TestWorldType] = GameInstance;
-
-		GameInstance->Init();
-		GameInstance->ClearFlags(RF_Standalone);
-		GameInstance->AddToRoot();
-
+		// Create WorldContext and World BEFORE GameInstance->Init() so that subsystem
+		// ShouldCreateSubsystem() checks (e.g., checking NetMode) can see the World.
+		// The World uses bSkipInitWorld=true so early creation is safe.
 		FWorldContext& WorldContext = GEngine->CreateNewWorldContext(EWorldType::Game);
-		GameInstance->SetWorldContext(&WorldContext);
-		WorldContext.PIEInstance = TestWorldType;
+		WorldContext.PIEInstance = PIEInstanceIndex;
 		WorldContext.bWaitingOnOnlineSubsystem = false;
-
 		WorldContext.PIEWorldFeatureLevel = GEditor->PreviewPlatform.GetEffectivePreviewFeatureLevel();
-		WorldContext.RunAsDedicated = (TestWorldType == EUntestWorldType::Server);
+		WorldContext.RunAsDedicated = bIsServerIter;
 		WorldContext.bIsPrimaryPIEInstance = false;
-		WorldContext.OwningGameInstance = GameInstance;
 
 		const bool bInformEngineOfWorld = false;
-		const FName WorldName = FName(*FString::Printf(TEXT("TestWorld_%s"), *TestName));
+		const FName WorldName = FName(*FString::Printf(TEXT("TestWorld_%s_%s%d"), *TestName, NetModeStr, bIsServerIter ? 0 : ClientIndex));
 		const bool bAddToRoot = false;
 
 		UWorld* World = UWorld::CreateWorld(EWorldType::Game, bInformEngineOfWorld, WorldName, Package, bAddToRoot, ERHIFeatureLevel::Num, nullptr, true /*bSkipInitWorld*/);
@@ -301,21 +373,49 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 		}
 
 		World->GetWorldSettings()->DefaultGameMode = Classes.GameModeClass;
-		World->SetGameInstance(GameInstance);
 		World->ClearFlags(RF_Standalone);
 		World->SetPlayInEditorInitialNetMode(NetMode);
 		World->bAllowAudioPlayback = false;
 		World->bIsNameStableForNetworking = true;
 		WorldContext.SetCurrentWorld(World);
 
-		TestContext.Worlds[TestWorldType] = World;
+		// Now create GameInstance with the World already visible, so subsystem
+		// ShouldCreateSubsystem() can query World->GetNetMode().
+		UUntestGameInstance* GameInstance = CastChecked<UUntestGameInstance>(NewObject<UUntestGameInstance>(Package, Classes.GameInstanceClass));
+
+		GameInstance->SetWorldContext(&WorldContext);
+		WorldContext.OwningGameInstance = GameInstance;
+		World->SetGameInstance(GameInstance);
+
+		GameInstance->Init();
+		GameInstance->ClearFlags(RF_Standalone);
+		GameInstance->AddToRoot();
+
+		// Stash into the appropriate slot now that the GI is initialized.
+		if (bIsServerIter)
+		{
+			TestContext.Packages[EUntestWorldType::Server] = Package;
+			TestContext.GameInstances[EUntestWorldType::Server] = GameInstance;
+			TestContext.Worlds[EUntestWorldType::Server] = World;
+		}
+		else if (ClientIndex == 0)
+		{
+			TestContext.Packages[EUntestWorldType::Client] = Package;
+			TestContext.GameInstances[EUntestWorldType::Client] = GameInstance;
+			TestContext.Worlds[EUntestWorldType::Client] = World;
+		}
+		else
+		{
+			TestContext.ExtraClientPackages.Add(Package);
+			TestContext.ExtraClientGameInstances.Add(GameInstance);
+			TestContext.ExtraClientWorlds.Add(World);
+		}
 
 		const ULevelEditorPlaySettings* DefaultSettings = GetDefault<ULevelEditorPlaySettings>();
 		uint16 ServerPort = 0;
 		DefaultSettings->GetServerPort(ServerPort);
 		const FString URLString = FString::Printf(TEXT("127.0.0.1:%hu"), ServerPort);
 		FURL URL = FURL(nullptr, *URLString, TRAVEL_Absolute);
-		// URL.Map = TEXT("/Game/Developers/Test/Levels/Default");
 		URL.Port = ServerPort;
 
 		if (NetMode == NM_DedicatedServer)
@@ -331,27 +431,11 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 
 			World->SetGameMode(URL);
 
-			// AGameModeBase* GameMode = World->SpawnActor<AGameModeBase>(SpawnInfo);
-			// if (GameMode == nullptr)
-			// {
-			// 	TestContext.AddError(TEXT("Failed to spawn GameMode"));
-			// }
-
 			// Make sure "always loaded" sub-levels are fully loaded
 			// TODO make sure this is OK???
 			World->FlushLevelStreaming(EFlushLevelStreamingType::Visibility);
 
-			// TODO should create AI system?
-			// World->CreateAISystem();
-
 			World->InitializeActorsForPlay(URL, true /*bResetTime*/, nullptr /*FRegisterComponentContext*/);
-
-			// calling it after InitializeActorsForPlay has been called to have all potential bounding boxed initialized
-			// TODO should initialize navigation system??
-			// FNavigationSystem::AddNavigationSystemToWorld(*World, FNavigationSystemRunMode::PIEMode);
-
-			// TODO should we do this?
-			// GEngine->BlockTillLevelStreamingCompleted(World);
 
 			// See UGameInstance::EnableListenServer() for this logic. We can't call it directly because it requires
 			// the World to be PIE.
@@ -424,13 +508,24 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 
 			World->InitializeActorsForPlay(URL, true /*bResetTime*/, nullptr /*FRegisterComponentContext*/);
 
-			// Networked connections require a player controller, which asserts a ULocalPlayer exists
+			// Networked connections require a player controller, which asserts a ULocalPlayer exists.
+			// Temporarily set viewport on WorldContext during AddLocalPlayer for subsystem init.
 			{
-				const FPlatformUserId UserId = IPlatformInputDeviceMapper::Get().GetPrimaryPlatformUser();
+				TGuardValue<bool> EditorGuard(GIsEditor, false);
+				UUntestViewportClient* VC = NewObject<UUntestViewportClient>(GEngine);
+				VC->InitForTest(World, GameInstance);
+				WorldContext.GameViewport = VC;
 
-				ULocalPlayer* NewPlayer = NewObject<ULocalPlayer>(GEngine, ULocalPlayer::StaticClass());
+				const FPlatformUserId UserId = IPlatformInputDeviceMapper::Get().GetPrimaryPlatformUser();
+				UCommonLocalPlayer* NewPlayer = NewObject<UCommonLocalPlayer>(GEngine, UCommonLocalPlayer::StaticClass());
 				int32 InsertIndex = GameInstance->AddLocalPlayer(NewPlayer, UserId);
 				check(InsertIndex != INDEX_NONE);
+
+				// Disable player view to prevent Niagara (and other rendering systems)
+				// from calling GetProjectionData with the sentinel FViewport* during world ticks.
+				NewPlayer->SetIsPlayerViewEnabled(false);
+
+				WorldContext.GameViewport = nullptr;
 			}
 		}
 
@@ -440,16 +535,27 @@ UntestTask FBVClientServerTestFixture::SetupFixture(const FString TestName)
 	co_await Setup(TestContext);
 }
 
-UntestTask FBVClientServerTestFixture::RunFixture(const FString TestName)
+UntestTask FUntestClientServerFixture::RunFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
+
+	const int32 NumClients = FMath::Max(1, GetNumClients());
 
 	UntestTask ServerTask = Run(GetContext(), EUntestWorldType::Server);
-	UntestTask ClientTask = Run(GetContext(), EUntestWorldType::Client);
+
+	// One ClientTask per client world. The macro layer always passes _WorldType==Client; tests
+	// that need to differentiate among clients use UNTEST_IS_CLIENT() to short-circuit.
+	// N clients => N independent client tasks.
+	TArray<UntestTask> ClientTasks;
+	ClientTasks.Reserve(NumClients);
+	for (int32 i = 0; i < NumClients; ++i)
+	{
+		ClientTasks.Add(Run(GetContext(), EUntestWorldType::Client));
+	}
 
 	double LastTimestamp = FPlatformTime::Seconds();
 
-	auto Func = [this, &ServerTask, &ClientTask, &LastTimestamp]()
+	auto Func = [this, &ServerTask, &ClientTasks, &LastTimestamp]()
 	{
 		const double Now = FPlatformTime::Seconds();
 		const double DeltaSeconds = Now - LastTimestamp;
@@ -457,23 +563,36 @@ UntestTask FBVClientServerTestFixture::RunFixture(const FString TestName)
 
 		FUntestContext& TestContext = GetContext();
 
-		TestContext.Worlds[EUntestWorldType::Server]->Tick(LEVELTICK_All, DeltaSeconds);
+		if (UWorld* ServerWorld = TestContext.Worlds[EUntestWorldType::Server].Get())
+		{
+			ServerWorld->Tick(LEVELTICK_All, DeltaSeconds);
+		}
 		ServerTask.Resume();
 
-		TestContext.Worlds[EUntestWorldType::Client]->Tick(LEVELTICK_All, DeltaSeconds);
-		ClientTask.Resume();
+		const int32 NumLocalClients = ClientTasks.Num();
+		for (int32 i = 0; i < NumLocalClients; ++i)
+		{
+			if (UWorld* ClientWorld = TestContext.GetClientWorld(i))
+			{
+				ClientWorld->Tick(LEVELTICK_All, DeltaSeconds);
+			}
+			ClientTasks[i].Resume();
+		}
 
-		const bool bIsServerDone = ServerTask.IsDone();
-		const bool bIsClientDone = ClientTask.IsDone();
-		return bIsServerDone && bIsClientDone;
+		bool bAllDone = ServerTask.IsDone();
+		for (int32 i = 0; i < NumLocalClients && bAllDone; ++i)
+		{
+			bAllDone = bAllDone && ClientTasks[i].IsDone();
+		}
+		return bAllDone;
 	};
 
 	co_await Squid::WaitUntil(Func);
 }
 
-UntestTask FBVClientServerTestFixture::TeardownFixture(const FString TestName)
+UntestTask FUntestClientServerFixture::TeardownFixture(const FString TestName)
 {
-	BV_FIXTURE_TASK_NAME(TestName);
+	UNTEST_FIXTURE_TASK_NAME(TestName);
 
 	FUntestContext& TestContext = GetContext();
 	co_await Teardown(TestContext);
@@ -481,7 +600,7 @@ UntestTask FBVClientServerTestFixture::TeardownFixture(const FString TestName)
 	TeardownClientServer();
 }
 
-void FBVClientServerTestFixture::TeardownClientServer()
+void FUntestClientServerFixture::TeardownClientServer()
 {
 	FUntestContext& TestContext = GetContext();
 
@@ -493,11 +612,23 @@ void FBVClientServerTestFixture::TeardownClientServer()
 		}
 	}
 
-	for (int32 TestWorldType = EUntestWorldType::Server; TestWorldType != EUntestWorldType::Count; ++TestWorldType)
+	auto TeardownOneSlot = [](UGameInstance* GameInstance, UWorld* World, UPackage* Package)
 	{
-		UGameInstance* GameInstance = TestContext.GameInstances[TestWorldType].Get();
-		UWorld* World = TestContext.Worlds[TestWorldType].Get();
-		UPackage* Package = TestContext.Packages[TestWorldType].Get();
+		// Remove local players BEFORE world teardown so their subsystems can
+		// deinitialize while the world is still valid. UUntestGameInstance blocks
+		// RemoveLocalPlayer by default to prevent accidental removal during
+		// CleanupGameViewport; we explicitly enable it here for teardown.
+		if (GameInstance)
+		{
+			if (UUntestGameInstance* TestGI = Cast<UUntestGameInstance>(GameInstance))
+			{
+				TestGI->SetAllowRemoveLocalPlayer(true);
+			}
+			while (GameInstance->GetLocalPlayers().Num() > 0)
+			{
+				GameInstance->RemoveLocalPlayer(GameInstance->GetLocalPlayers().Last());
+			}
+		}
 
 		if (World)
 		{
@@ -525,13 +656,37 @@ void FBVClientServerTestFixture::TeardownClientServer()
 			Package->RemoveFromRoot();
 			Package->ConditionalBeginDestroy();
 		}
+	};
+
+	// Tear down the canonical Server / Client(==index 0) slots first.
+	for (int32 TestWorldType = EUntestWorldType::Server; TestWorldType != EUntestWorldType::Count; ++TestWorldType)
+	{
+		UGameInstance* GameInstance = TestContext.GameInstances[TestWorldType].Get();
+		UWorld* World = TestContext.Worlds[TestWorldType].Get();
+		UPackage* Package = TestContext.Packages[TestWorldType].Get();
+
+		TeardownOneSlot(GameInstance, World, Package);
 
 		TestContext.Worlds[TestWorldType].Reset();
 		TestContext.GameInstances[TestWorldType].Reset();
 		TestContext.Packages[TestWorldType].Reset();
 	}
 
-	FSoftObjectPath::ClearPIEPackageNames();
+	// Tear down extra clients (indices 1..N-1) using the same teardown body.
+	const int32 NumExtraClients = TestContext.ExtraClientWorlds.Num();
+	for (int32 i = 0; i < NumExtraClients; ++i)
+	{
+		UGameInstance* GameInstance = TestContext.ExtraClientGameInstances.IsValidIndex(i) ? TestContext.ExtraClientGameInstances[i].Get() : nullptr;
+		UWorld* World = TestContext.ExtraClientWorlds[i].Get();
+		UPackage* Package = TestContext.ExtraClientPackages.IsValidIndex(i) ? TestContext.ExtraClientPackages[i].Get() : nullptr;
 
+		TeardownOneSlot(GameInstance, World, Package);
+	}
+
+	TestContext.ExtraClientWorlds.Reset();
+	TestContext.ExtraClientGameInstances.Reset();
+	TestContext.ExtraClientPackages.Reset();
+
+	FSoftObjectPath::ClearPIEPackageNames();
 	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 }

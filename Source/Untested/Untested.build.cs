@@ -10,16 +10,24 @@ public class Untested : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"CommonGame",
 			"SquidTasks",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"ApplicationCore",
-			"InputCore",
-			"Slate",
-			"SlateCore",
-			"UnrealEd",
-			"WorkspaceMenuStructure",
 		});
+
+		if (Target.Type == TargetType.Editor)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[]
+			{
+				"ApplicationCore",
+				"InputCore",
+				"Slate",
+				"SlateCore",
+				"UnrealEd",
+				"WorkspaceMenuStructure",
+			});
+		}
 	}
 }

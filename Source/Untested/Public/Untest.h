@@ -6,14 +6,22 @@
 
 #include "Containers/StaticArray.h"
 #include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
+#include "CommonLocalPlayer.h"
+#include "Engine/LocalPlayer.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerController.h"
+#include "SceneView.h"
 #include "SquidTasks/Task.h"
+#include "SquidTasks/TaskManager.h"
 #include "UObject/Package.h"
-#include "Engine/GameInstance.h"
 #include "Untest.generated.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogUntest, Display, All);
 
 // For sorting in UI
+// TODO move to module header
 UENUM()
 enum class EUntestTypeFlags : uint32
 {
@@ -30,8 +38,9 @@ UENUM()
 enum class EUntestFlags : uint32
 {
 	None = 0x00,
-	Disabled = 0x01, // Will be skipped in all test runs
-	Pure = 0x02,	 // Has no side effects - can be run multithreaded
+	Disabled = 0x01,				// Will be skipped in all test runs
+	Pure = 0x02,					// Has no side effects - can be run multithreaded
+	RequiresExternalService = 0x04, // Requires an external service; skipped if PreflightCheck fails
 };
 
 ENUM_CLASS_FLAGS(EUntestFlags)
@@ -67,6 +76,72 @@ class UUntestGameInstance : public UGameInstance
 
 public:
 	void SetWorldContext(FWorldContext* InWorldContext) { WorldContext = InWorldContext; }
+	void SetAllowRemoveLocalPlayer(bool bAllow) { bAllowRemoveLocalPlayer = bAllow; }
+
+	// Prevent CleanupGameViewport() from removing test LocalPlayers when their
+	// ViewportClient has no real Viewport (UE checks !ViewportClient->Viewport).
+	// During explicit teardown, SetAllowRemoveLocalPlayer(true) enables removal.
+	virtual bool RemoveLocalPlayer(ULocalPlayer* ExistingPlayer) override
+	{
+		if (!bAllowRemoveLocalPlayer)
+		{
+			return false;
+		}
+		return Super::RemoveLocalPlayer(ExistingPlayer);
+	}
+
+private:
+	bool bAllowRemoveLocalPlayer = false;
+};
+
+UCLASS()
+class UUntestViewportClient : public UGameViewportClient
+{
+	GENERATED_BODY()
+
+public:
+	void InitForTest(UWorld* InWorld, UGameInstance* InGameInstance)
+	{
+		World = InWorld;
+		GameInstance = InGameInstance;
+	}
+
+	// Slate is not available in commandlet mode, so skip the base implementations that call FSlateApplication::Get().
+	virtual void NotifyPlayerAdded(int32 PlayerIndex, ULocalPlayer* AddedPlayer) override {}
+	virtual void NotifyPlayerRemoved(int32 PlayerIndex, ULocalPlayer* RemovedPlayer) override {}
+	virtual void DetachViewportClient() override {}
+};
+
+// PlayerController safe for commandlet mode where FSlateApplication may not be initialized.
+// SVirtualJoystick::ShouldDisplayTouchInterface() unconditionally calls FSlateApplication::Get().
+UCLASS()
+class AUntestPlayerController : public APlayerController
+{
+	GENERATED_BODY()
+
+public:
+	virtual void CreateTouchInterface() override
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			return;
+		}
+		Super::CreateTouchInterface();
+	}
+};
+
+// Default game mode for client-server tests. Uses AUntestPlayerController to avoid
+// Slate assertions in commandlet mode.
+UCLASS()
+class AUntestGameMode : public AGameModeBase
+{
+	GENERATED_BODY()
+
+public:
+	AUntestGameMode()
+	{
+		PlayerControllerClass = AUntestPlayerController::StaticClass();
+	}
 };
 
 struct FUntestFixture;
@@ -91,6 +166,20 @@ struct UNTESTED_API FUntestName
 	FString ToFull() const
 	{
 		return FString::Printf(TEXT("%s.%s.%s"), *Module, *Category, *Test);
+	}
+
+	static FUntestName FromFull(const FString& FullName)
+	{
+		FUntestName Name;
+		TArray<FString> Parts;
+		FullName.ParseIntoArray(Parts, TEXT("."));
+		if (Parts.Num() >= 1)
+			Name.Module = Parts[0];
+		if (Parts.Num() >= 2)
+			Name.Category = Parts[1];
+		if (Parts.Num() >= 3)
+			Name.Test = Parts[2];
+		return Name;
 	}
 };
 
@@ -132,6 +221,9 @@ public:
 	UGameInstance* GetGameInstance(EUntestWorldType::Enum Type);
 	UWorld* GetWorld(EUntestWorldType::Enum Type);
 
+	/** Returns client world by index. Index 0 == Worlds[EUntestWorldType::Client]; 1..N-1 == ExtraClientWorlds[Index-1]. Returns nullptr for out-of-range indices. */
+	UWorld* GetClientWorld(int32 Index);
+
 private:
 	FUntestName TestName;
 	double TimeoutMs = 0.0;
@@ -149,10 +241,16 @@ private:
 	TStaticArray<TWeakObjectPtr<UWorld>, EUntestWorldType::Count> Worlds;
 	TArray<TWeakObjectPtr<UObject>> Objects;
 
+	// Additional client slots for N>=2; index 0 mirrors Worlds[EUntestWorldType::Client].
+	// Empty for the N==1 default. Parallel arrays so ExtraClient*[i] all describe client (i+1).
+	TArray<TWeakObjectPtr<UPackage>> ExtraClientPackages;
+	TArray<TWeakObjectPtr<UGameInstance>> ExtraClientGameInstances;
+	TArray<TWeakObjectPtr<UWorld>> ExtraClientWorlds;
+
 	friend class FUntestModule;
 	friend struct FUntestFixture;
-	friend struct FBVWorldTestFixture;
-	friend struct FBVClientServerTestFixture;
+	friend struct FUntestWorldFixture;
+	friend struct FUntestClientServerFixture;
 };
 
 struct UNTESTED_API FUntestFixtureFactory
@@ -200,16 +298,10 @@ struct FUntestLineContext
 	bool bIsAssert;
 };
 
-template <typename T>
+template <typename T, typename = typename TEnableIf<!TIsCharType<T>::Value>::Type>
 inline FString LexToString(const T* Value)
 {
 	return FString::Printf(TEXT("%p"), Value);
-}
-
-template <>
-inline FString LexToString<TCHAR>(const TCHAR* Value)
-{
-	return FString(Value);
 }
 
 namespace Impl
@@ -239,8 +331,8 @@ namespace Impl
 	DEFINE_VALUETOSTR_ARITHMETIC_FUNC(int32,    int32,    "%d")
 	DEFINE_VALUETOSTR_ARITHMETIC_FUNC(int64,    int64,    "%ld")
 	DEFINE_VALUETOSTR_ARITHMETIC_FUNC(long,     long,     "%d")
-	DEFINE_VALUETOSTR_ARITHMETIC_FUNC(WIDECHAR, WIDECHAR, "%lc")
-	DEFINE_VALUETOSTR_ARITHMETIC_FUNC(ANSICHAR, ANSICHAR, "%c")
+	template <> inline FString ValueToString(const WIDECHAR& Value) { return FString(TEXT(" (")) + FString::Chr(Value) + TEXT(") "); }
+	template <> inline FString ValueToString(const ANSICHAR& Value) { return FString::Printf(TEXT(" (%c) "), Value); }
 	// clang-format on
 
 #undef DEFINE_VALUETOSTR_ARITHMETIC_FUNC
@@ -536,39 +628,57 @@ inline UWorld* FUntestContext::GetWorld(EUntestWorldType::Enum Type)
 	return Worlds[static_cast<int32>(Type)].Get();
 }
 
+inline UWorld* FUntestContext::GetClientWorld(int32 Index)
+{
+	if (Index < 0)
+	{
+		return nullptr;
+	}
+	if (Index == 0)
+	{
+		return Worlds[static_cast<int32>(EUntestWorldType::Client)].Get();
+	}
+	const int32 ExtraIndex = Index - 1;
+	if (!ExtraClientWorlds.IsValidIndex(ExtraIndex))
+	{
+		return nullptr;
+	}
+	return ExtraClientWorlds[ExtraIndex].Get();
+}
+
 #define UNTEST_IMPL_NAME(Module, Category, TestName, FixtureType) Module##Category##TestName##_TestFixture
 
-#define UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                    \
-	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                         \
-	{                                                                                                                                              \
-		static_assert(TIsDerivedFrom<FixtureType, FBVUnitTestFixture>::IsDerived, "Only fixtures inheriting from FBVUnitTestFixture are allowed"); \
-		virtual UntestTask Run(FUntestContext& TestContext) override;                                                                              \
-	};                                                                                                                                             \
-	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =            \
-		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                         \
-			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                      \
+#define UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                        \
+	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                             \
+	{                                                                                                                                                  \
+		static_assert(TIsDerivedFrom<FixtureType, FUntestUnitFixture>::IsDerived, "Only fixtures inheriting from FUntestUnitFixture are allowed");     \
+		virtual UntestTask Run(FUntestContext& TestContext) override;                                                                                  \
+	};                                                                                                                                                 \
+	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =                \
+		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                             \
+			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                          \
 	UntestTask UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)::Run(FUntestContext& TestContext)
 
-#define UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                     \
-	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                           \
-	{                                                                                                                                                \
-		static_assert(TIsDerivedFrom<FixtureType, FBVWorldTestFixture>::IsDerived, "Only fixtures inheriting from FBVWorldTestFixture are allowed"); \
-		virtual UntestTask Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType) override;                                       \
-	};                                                                                                                                               \
-	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =              \
-		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                           \
-			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                        \
+#define UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                       \
+	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                             \
+	{                                                                                                                                                  \
+		static_assert(TIsDerivedFrom<FixtureType, FUntestWorldFixture>::IsDerived, "Only fixtures inheriting from FUntestWorldFixture are allowed");   \
+		virtual UntestTask Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType) override;                                         \
+	};                                                                                                                                                 \
+	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =                \
+		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                             \
+			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                          \
 	UntestTask UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)::Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType)
 
-#define UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                            \
-	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                                         \
-	{                                                                                                                                                              \
-		static_assert(TIsDerivedFrom<FixtureType, FBVClientServerTestFixture>::IsDerived, "Only fixtures inheriting from FBVClientServerTestFixture are allowed"); \
-		virtual UntestTask Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType) override;                                                     \
-	};                                                                                                                                                             \
-	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =                            \
-		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                                         \
-			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                                      \
+#define UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)                                                                                \
+	struct UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture) : public FixtureType                                                                             \
+	{                                                                                                                                                                  \
+		static_assert(TIsDerivedFrom<FixtureType, FUntestClientServerFixture>::IsDerived, "Only fixtures inheriting from FUntestClientServerFixture are allowed");     \
+		virtual UntestTask Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType) override;                                                         \
+	};                                                                                                                                                                 \
+	TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)> Module##Category##TestName##_TestFixtureFactory =                                \
+		TUntestFixtureFactory<UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)>(                                                                             \
+			TEXT(#Module), TEXT(#Category), TEXT(#TestName), FixtureType::TestType(), FixtureType::DefaultTimeoutMs(), Opts);                                          \
 	UntestTask UNTEST_IMPL_NAME(Module, Category, TestName, _TestFixture)::Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType)
 
 #define UNTEST_LINE_CONTEXT(A, B, bIsAssert) (FUntestLineContext(TEXT(__FILE__), __LINE__, TEXT(A), TEXT(B), bIsAssert))
@@ -601,19 +711,19 @@ inline UWorld* FUntestContext::GetWorld(EUntestWorldType::Enum Type)
 //     co_return;
 // }
 
-#define UNTEST_UNIT(Module, Category, TestName) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FBVUnitTestFixture, FUntestOpts())
-#define UNTEST_UNIT_OPTS(Module, Category, TestName, Opts) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FBVUnitTestFixture, Opts)
-#define UNTEST_UNIT_PURE(Module, Category, TestName) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FBVUnitTestFixture, UNTEST_PURE())
+#define UNTEST_UNIT(Module, Category, TestName) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FUntestUnitFixture, FUntestOpts())
+#define UNTEST_UNIT_OPTS(Module, Category, TestName, Opts) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FUntestUnitFixture, Opts)
+#define UNTEST_UNIT_PURE(Module, Category, TestName) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FUntestUnitFixture, UNTEST_PURE())
 #define UNTEST_UNIT_F(FixtureType, Module, Category, TestName) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FixtureType, FUntestOpts())
 #define UNTEST_UNIT_F_OPTS(FixtureType, Module, Category, TestName, Opts) UNTEST_UNIT_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)
 
-#define UNTEST_WORLD(Module, Category, TestName) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FBVWorldTestFixture, FUntestOpts())
-#define UNTEST_WORLD_OPTS(Module, Category, TestName, Opts) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FBVWorldTestFixture, Opts)
+#define UNTEST_WORLD(Module, Category, TestName) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FUntestWorldFixture, FUntestOpts())
+#define UNTEST_WORLD_OPTS(Module, Category, TestName, Opts) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FUntestWorldFixture, Opts)
 #define UNTEST_WORLD_F(FixtureType, Module, Category, TestName) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FixtureType, FUntestOpts())
 #define UNTEST_WORLD_F_OPTS(FixtureType, Module, Category, TestName, Opts) UNTEST_WORLD_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)
 
-#define UNTEST_CLIENTSERVER(Module, Category, TestName) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FBVClientServerTestFixture, FUntestOpts())
-#define UNTEST_CLIENTSERVER_OPTS(Module, Category, TestName, Opts) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FBVClientServerTestFixture, Opts)
+#define UNTEST_CLIENTSERVER(Module, Category, TestName) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FUntestClientServerFixture, FUntestOpts())
+#define UNTEST_CLIENTSERVER_OPTS(Module, Category, TestName, Opts) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FUntestClientServerFixture, Opts)
 #define UNTEST_CLIENTSERVER_F(FixtureType, Module, Category, TestName) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FixtureType, FUntestOpts())
 #define UNTEST_CLIENTSERVER_F_OPTS(FixtureType, Module, Category, TestName, Opts) UNTEST_CLIENTSERVER_IMPL_FIXTURE(Module, Category, TestName, FixtureType, Opts)
 
@@ -679,6 +789,9 @@ struct UNTESTED_API FUntestFixture
 public:
 	virtual ~FUntestFixture() = default;
 
+	// Called before Setup. Return false to skip with a reason.
+	virtual bool PreflightCheck(FString& OutSkipReason) const { return true; }
+
 	// For test framework only
 	virtual UntestTask SetupFixture(const FString TestName);
 	virtual UntestTask RunFixture(const FString TestName) = 0;
@@ -696,11 +809,11 @@ public:
 private:
 	TSharedPtr<FUntestContext> FixtureContext;
 
-	friend struct FBVUnitTestFixture;
-	friend struct FBVClientServerTestFixture;
+	friend struct FUntestUnitFixture;
+	friend struct FUntestClientServerFixture;
 };
 
-struct UNTESTED_API FBVUnitTestFixture : public FUntestFixture
+struct UNTESTED_API FUntestUnitFixture : public FUntestFixture
 {
 public:
 	static EUntestTypeFlags TestType() { return EUntestTypeFlags::Unit; }
@@ -713,13 +826,28 @@ public:
 	virtual UntestTask Run(FUntestContext& TestContext) = 0;
 };
 
-struct UNTESTED_API FBVWorldTestFixture : public FUntestFixture
+struct FUntestGameClasses
+{
+	TSubclassOf<UUntestGameInstance> GameInstanceClass;
+	TSubclassOf<AGameModeBase> GameModeClass;
+};
+
+struct UNTESTED_API FUntestWorldFixture : public FUntestFixture
 {
 public:
 	static EUntestTypeFlags TestType() { return EUntestTypeFlags::World; }
-	static float DefaultTimeoutMs() { return 1000.0f; }
+	static float DefaultTimeoutMs() { return 10000.0f; }
 
-	virtual ~FBVWorldTestFixture();
+	virtual ~FUntestWorldFixture();
+
+	// Override to customize GameInstance and GameMode classes
+	virtual FUntestGameClasses GetGameClasses() const { return FUntestGameClasses(); }
+
+	// Override to request LocalPlayer creation in the test world
+	virtual bool ShouldCreateLocalPlayer() const { return false; }
+
+	// Override to specify the LocalPlayer class to create
+	virtual TSubclassOf<ULocalPlayer> GetLocalPlayerClass() const;
 
 	// Derived fixtures may override these functions to inject code at each of these steps
 	virtual UntestTask SetupFixture(const FString TestName) override;
@@ -738,18 +866,12 @@ public:
 	void TeardownWorld();
 };
 
-struct FUntestGameClasses
-{
-	TSubclassOf<UUntestGameInstance> GameInstanceClass;
-	TSubclassOf<AGameModeBase> GameModeClass;
-};
-
-struct UNTESTED_API FBVClientServerTestFixture : public FUntestFixture
+struct UNTESTED_API FUntestClientServerFixture : public FUntestFixture
 {
 	static EUntestTypeFlags TestType() { return EUntestTypeFlags::ClientServer; }
-	static float DefaultTimeoutMs() { return 2000.0f; }
+	static float DefaultTimeoutMs() { return 10000.0f; }
 
-	virtual ~FBVClientServerTestFixture();
+	virtual ~FUntestClientServerFixture();
 
 	// Derived fixtures may override these functions to inject code at each of these steps
 	virtual UntestTask SetupFixture(const FString TestName) override;
@@ -759,6 +881,11 @@ struct UNTESTED_API FBVClientServerTestFixture : public FUntestFixture
 	// Internal usage only
 	virtual FUntestGameClasses GetGameClasses() const { return FUntestGameClasses(); };
 	virtual UntestTask Run(FUntestContext& TestContext, const EUntestWorldType::Enum _WorldType) = 0;
+
+	// Override to opt into N-client topology. Default is 1 to preserve every existing caller.
+	// _WorldType passed into Run() remains either Server or Client; Run() is invoked once per client
+	// when N>=2, with the same _WorldType==Client and the per-iteration ClientTask consuming each.
+	virtual int32 GetNumClients() const { return 1; }
 
 	// For fixture usage only
 	void TeardownClientServer();
@@ -782,7 +909,7 @@ TSharedPtr<FUntestFixture> TUntestFixtureFactory<T>::New(const TSharedPtr<FUntes
 }
 
 template <typename T>
-T* FBVWorldTestFixture::NewTestObject()
+T* FUntestWorldFixture::NewTestObject()
 {
 	FUntestContext& Context = GetContext();
 	UWorld* World = Context.GetWorld(EUntestWorldType::Server);

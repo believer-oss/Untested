@@ -1,8 +1,8 @@
 #include "UntestUI.h"
 
-// UI is only allowed in windows editor because some features (such as SMultilineEditableText)
-// are apparently not allowed on other platforms
-#if WITH_EDITOR && PLATFORM_WINDOWS
+// UI was previously Windows-only due to SMultiLineEditableText concerns, but that widget
+// works fine on Mac and Linux in current UE versions.
+#if WITH_EDITOR
 
 #include "Untest.h"
 #include "UntestModule.h"
@@ -30,7 +30,7 @@
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Notifications/SProgressBar.h"
-#include "Widgets/Text/SMultilineEditableText.h"
+#include "Widgets/Text/SMultiLineEditableText.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SExpanderArrow.h"
 #include "Widgets/Views/STreeView.h"
@@ -1019,8 +1019,8 @@ FReply SUntestRunner::RunOrAbortTests()
 		NumFailedTests = 0;
 		ResultsText->SetText(FText());
 
-		auto OnTestCompleteDelegate = FBVOnTestComplete::CreateRaw(this, &SUntestRunner::OnTestComplete);
-		auto OnAllTestsCompleteDelegate = FBVOnAllTestsComplete::CreateRaw(this, &SUntestRunner::OnAllTestsComplete);
+		auto OnTestCompleteDelegate = FUntestOnTestComplete::CreateRaw(this, &SUntestRunner::OnTestComplete);
+		auto OnAllTestsCompleteDelegate = FUntestOnAllTestsComplete::CreateRaw(this, &SUntestRunner::OnAllTestsComplete);
 
 		FUntestRunOpts RunOpts;
 		RunOpts.bNoTimeouts = Options.bIsTimeoutEnabled == false;
@@ -1344,7 +1344,7 @@ TSharedRef<SDockTab> FUntestUI::OnSpawnTab(const FSpawnTabArgs& SpawnTabArgs)
 
 #undef LOCTEXT_NAMESPACE
 
-#else // WITH_EDITOR
+#else // !WITH_EDITOR
 
 FUntestUI::FUntestUI() {}
 FUntestUI::~FUntestUI() {}
